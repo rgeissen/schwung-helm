@@ -55,6 +55,7 @@ typedef plugin_api_v2_t *(*move_plugin_init_v2_fn)(const host_api_v1_t *host);
 #include "load_save.h"
 #include "midi_manager.h"
 #include "synth_base.h"
+#include "value_switch.h"
 
 /* Host API reference */
 static const host_api_v1_t *g_host = nullptr;
@@ -152,6 +153,31 @@ typedef struct helm_instance_t {
   char *ui_hierarchy_json;
   char *chain_params_json;
 
+  /* Modulation, live (get_param("live_mod")): every modulation destination's
+   * totals as Helm's own modulation meters read them (modulation_meter.cpp:
+   * the mono total, knob included, plus the newest voice's poly total) and
+   * their switches, resolved once at create (live_setup). After each block the
+   * audio path stores where each destination is (live_val, in the parameter's
+   * raw units, while its switch is on: off, the total is not computed) and the
+   * cutoff the filter takes (live_cutoff_val: those totals plus the hard-wired
+   * key track and filter envelope, helm_voice_handler.cpp createFilter);
+   * get_param formats them. No allocation, lookup or lock after create. */
+  struct live_dest {
+    std::string name;
+    mopo::Output *mono, *poly;
+    mopo::ValueSwitch *mono_on, *poly_on;
+    mopo::Value *knob;
+    float lo, hi;
+  };
+  std::vector<live_dest> live_dests;
+  std::vector<float> live_val;
+  std::vector<char> live_on;
+  mopo::Output *live_fil_env;  /* fil_envelope_amp: the newest voice's filter envelope, 0..1 */
+  int live_cutoff, live_env_depth, live_keytrack; /* indices into live_dests, -1: none */
+  int live_voices;             /* voices sounding after the last block (releases included) */
+  float live_cutoff_val;
+  mopo::Value *live_filter_on; /* the filter's switch: off, nothing of the filter's is reported */
+
   helm_instance_t() {
     memset(module_dir, 0, sizeof(module_dir));
     memset(error_msg, 0, sizeof(error_msg));
@@ -167,6 +193,11 @@ typedef struct helm_instance_t {
     clock_time_sum = 0.0;
     ui_hierarchy_json = nullptr;
     chain_params_json = nullptr;
+    live_fil_env = nullptr;
+    live_cutoff = live_env_depth = live_keytrack = -1;
+    live_voices = 0;
+    live_cutoff_val = 0.0f;
+    live_filter_on = nullptr;
 
     for (int i = 0; i < 16; i++) {
       mod_slots[i].enabled = false;
@@ -775,6 +806,8 @@ static void build_chain_params(helm_instance_t *inst) {
 /* =====================================================================
  * Plugin API v2 Implementation
  * ===================================================================== */
+static void live_setup(helm_instance_t *inst); /* live_mod, below */
+
 static void *v2_create_instance(const char *module_dir,
                                 const char *json_defaults) {
   (void)json_defaults;
@@ -859,6 +892,7 @@ static void *v2_create_instance(const char *module_dir,
 
   build_ui_hierarchy(inst);
   build_chain_params(inst);
+  live_setup(inst);
 
   return inst;
 }
@@ -1115,6 +1149,101 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
   }
 }
 
+/* Modulation, live: one destination's value as the sound has it after the
+ * last block (live_store), its knob while its totals are switched off. */
+static float live_total(const helm_instance_t::live_dest &d, bool on, float val) {
+  return on ? val : (float)d.knob->value();
+}
+
+/* the audio path, after each block: where every switched-on destination is,
+ * and the cutoff the filter takes (live_mod) */
+static void live_store(helm_instance_t *inst) {
+  mopo::HelmEngine *engine = inst->synth->getEngine();
+  inst->live_voices = engine->getNumActiveVoices();
+  if (inst->live_voices == 0)
+    return;
+  for (size_t i = 0; i < inst->live_dests.size(); i++) {
+    const helm_instance_t::live_dest &d = inst->live_dests[i];
+    bool on = d.mono_on && d.mono_on->value() != 0.0;
+    inst->live_on[i] = on;
+    if (on)
+      inst->live_val[i] = (float)(d.mono->buffer[0] +
+          (d.poly && d.poly_on && d.poly_on->value() != 0.0 ? d.poly->buffer[0] : 0.0));
+  }
+  if (inst->live_cutoff >= 0) {
+    int c = inst->live_cutoff, e = inst->live_env_depth, k = inst->live_keytrack;
+    float cut = live_total(inst->live_dests[c], inst->live_on[c], inst->live_val[c]);
+    if (k >= 0) /* key track: (note - 64) x the key track amount */
+      cut += live_total(inst->live_dests[k], inst->live_on[k], inst->live_val[k]) *
+             (float)(engine->getLastActiveNote() - mopo::MIDI_SIZE / 2);
+    if (e >= 0 && inst->live_fil_env) /* the filter envelope x its depth */
+      cut += live_total(inst->live_dests[e], inst->live_on[e], inst->live_val[e]) *
+             (float)inst->live_fil_env->buffer[0];
+    inst->live_cutoff_val = cut;
+  }
+}
+
+/* at create: the destinations, their totals and switches, found once */
+static void live_setup(helm_instance_t *inst) {
+  mopo::HelmEngine *engine = inst->synth->getEngine();
+  mopo::output_map &mono = engine->getMonoModulations();
+  mopo::output_map &poly = engine->getPolyModulations();
+  mopo::control_map controls = engine->getControls();
+  inst->live_filter_on = controls.count("filter_on") ? controls["filter_on"] : nullptr;
+  for (auto &m : mono) {
+    if (!controls.count(m.first))
+      continue;
+    helm_instance_t::live_dest d;
+    d.name = m.first;
+    d.mono = m.second;
+    d.poly = poly.count(m.first) ? poly[m.first] : nullptr;
+    d.mono_on = engine->getMonoModulationSwitch(m.first);
+    d.poly_on = engine->getPolyModulationSwitch(m.first);
+    d.knob = controls[m.first];
+    mopo::ValueDetails det = mopo::Parameters::getDetails(m.first);
+    d.lo = (float)det.min;
+    d.hi = (float)det.max;
+    if (d.name == "cutoff") inst->live_cutoff = (int)inst->live_dests.size();
+    if (d.name == "fil_env_depth") inst->live_env_depth = (int)inst->live_dests.size();
+    if (d.name == "keytrack") inst->live_keytrack = (int)inst->live_dests.size();
+    inst->live_dests.push_back(d);
+  }
+  inst->live_val.assign(inst->live_dests.size(), 0.0f);
+  inst->live_on.assign(inst->live_dests.size(), 0);
+  inst->live_fil_env = engine->getModulationSource("fil_envelope_amp");
+}
+
+/* get_param("live_mod"): {"key": value, ...} in the parameters' raw units,
+ * clamped to their ranges: the cutoff always while a voice sounds, every
+ * other destination while something modulates it; {} while nothing sounds.
+ * The length it needs, as snprintf. */
+static int live_format(const helm_instance_t *inst, char *buf, int buf_len) {
+  if (inst->live_voices == 0)
+    return snprintf(buf, buf_len, "{}");
+  int n = 0;
+  auto put = [&](const char *name, float v, float lo, float hi) {
+    v = v < lo ? lo : (v > hi ? hi : v);
+    int at = n < buf_len ? n : buf_len;
+    n += snprintf(buf + at, (size_t)(buf_len - at), "%s\"%s\":%.4f", n == 0 ? "{" : ",", name, v);
+  };
+  /* a filter switched off moves nothing: its controls are left out */
+  const bool filter = !inst->live_filter_on || inst->live_filter_on->value() != 0.0;
+  auto of_filter = [](const std::string &k) {
+    return k == "cutoff" || k == "resonance" || k == "keytrack" || k == "filter_blend" ||
+           k == "filter_drive" || k == "filter_shelf";
+  };
+  if (inst->live_cutoff >= 0 && filter) {
+    const helm_instance_t::live_dest &c = inst->live_dests[inst->live_cutoff];
+    put("cutoff", inst->live_cutoff_val, c.lo, c.hi);
+  }
+  for (size_t i = 0; i < inst->live_dests.size(); i++)
+    if (inst->live_on[i] && (int)i != inst->live_cutoff && (filter || !of_filter(inst->live_dests[i].name)))
+      put(inst->live_dests[i].name.c_str(), inst->live_val[i], inst->live_dests[i].lo, inst->live_dests[i].hi);
+  int at = n < buf_len ? n : buf_len;
+  n += snprintf(buf + at, (size_t)(buf_len - at), n == 0 ? "{}" : "}");
+  return n;
+}
+
 static int v2_get_param(void *instance, const char *key, char *buf,
                         int buf_len) {
   helm_instance_t *inst = (helm_instance_t *)instance;
@@ -1166,6 +1295,11 @@ static int v2_get_param(void *instance, const char *key, char *buf,
 
   if (strcmp(key, "preset") == 0)
     return snprintf(buf, buf_len, "%d", inst->current_preset);
+  /* Modulation, live: where the newest voice has the controls Helm's own
+   * modulation moves, in their raw units; {} while nothing sounds
+   * (live_format) */
+  if (strcmp(key, "live_mod") == 0)
+    return live_format(inst, buf, buf_len);
   if (strcmp(key, "bpm") == 0) {
     mopo::control_map &controls = inst->synth->getControls();
     if (controls.count("beats_per_minute")) {
@@ -1296,6 +1430,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
   juce::AudioSampleBuffer float_buffer(2, frames);
   float_buffer.clear();
   inst->synth->process(&float_buffer, local_midi, frames);
+  live_store(inst); /* live_mod */
 
   /* Convert and interleave output */
   const float *left_chan = float_buffer.getReadPointer(0);
